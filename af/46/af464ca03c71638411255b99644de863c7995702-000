@@ -1,0 +1,252 @@
+"""Render the animated subtitle and title overlay for a 30 second short, piped straight into ffmpeg.
+
+WHY A PIPE. 900 RGBA frames at 1080x1920 would mean writing and re-reading ~7 GB of PNGs. Streaming
+raw frames to ffmpeg's stdin, as a second input, skips that entirely: no intermediate files, no
+compression overhead, one process reads what the other writes.
+
+FR : le pipe evite d ecrire puis relire des gigaoctets de PNG intermediaires.
+"""
+import sys
+
+# Restored 2026-09-12: legacy V4 title kept for comparison.
+from PIL import Image, ImageDraw, ImageFilter, ImageFont
+
+# -- PARAMETERS (HDA law: everything tunable lives here) -----------------------------------------
+P = {
+    'width': 1080,
+    'height': 1920,
+    'fps': 30,
+    'duration': 30.0,
+    # Corrected 2026-09-12: "Houdini" stays upright and "Procedural Church" stays italic.
+    # FR : "Houdini" reste droit et "Procedural Church" reste en italique.
+    'title_font': '/Users/zenray/Library/Fonts/AnthropicSerif-SemiBold.ttf',
+    'title_font_italic': '/Users/zenray/Library/Fonts/AnthropicSerif-SemiBoldItalic.ttf',
+    # Corrected again: NO forced uppercase anywhere in the title, sentence case throughout.
+    # Matthieu: "NON TOUT EN CASSE NORMAL".
+    # FR : plus aucune majuscule forcee, casse normale partout.
+    'title_text_upright': 'Houdini',
+    'title_text_italic': ' Louisiana Bayou',
+    'title_size_start': 130,           # the title is sized to the MAXIMUM px that still fits, never cropped
+    'title_max_pill_width_ratio': 0.92,
+    'title_pill_bg': (255, 255, 255, 255),
+    'title_text_color': (0, 0, 0, 255),
+    'title_radius_ratio': 0.30,
+    'title_pad_x_ratio': 0.55,
+    'title_pad_y_ratio': 0.42,
+    'title_y_center': 260,
+    'subtitle_font': '/Users/zenray/Library/Fonts/InterVariable.ttf',
+    # Corrected 2026-09-12: the bottom subtitles are Inter ExtraBold (800), not SemiBold (600).
+    # FR : les sous-titres du bas sont en Inter ExtraBold, pas SemiBold.
+    # Corrected 2026-09-12, final pass: #f8f671 read as too washed out. Matthieu: "un jaune
+    # complet normal". Pure vivid yellow, the same #FFE600 already documented as "jaune vif" in
+    # this skill's own history (section 6), not a pale tint.
+    # FR : jaune vif plein, pas une teinte pale.
+    'subtitle_weight': 900,
+    'subtitle_color': (0xFF, 0xE6, 0x00, 255),
+    'subtitle_size_start': 62,
+    'subtitle_max_width_ratio': 0.86,
+    'line1_y': 1520,
+    'line2_y': 1610,
+    # Subtle drop shadow added 2026-09-12 on both the yellow subtitles and the white title pill,
+    # so they lift off the new animated background instead of sitting flat on it.
+    # FR : ombre portee discrete sur les sous titres jaunes et la pastille blanche.
+    'subtitle_shadow_offset': (0, 5),
+    'subtitle_shadow_blur': 7,
+    'subtitle_shadow_color': (0, 0, 0, 130),
+    'title_shadow_offset': (0, 10),
+    'title_shadow_blur': 22,
+    'title_shadow_color': (0, 0, 0, 110),
+    'cue_seconds': 3.0,
+    'pop_line1_offset': 0.0,
+    'pop_line2_offset': 0.4,
+    # (time, scale, opacity) keyframes of the pop-in envelope, held at the last value after.
+    'pop_keys': [(0.0, 0.5, 0.0), (0.05, 0.5, 1.0), (0.15, 1.18, 1.0), (0.30, 0.96, 1.0), (0.45, 1.0, 1.0)],
+}
+
+CUES = [
+    ("Today I continued developing", "my procedural Louisiana bayou church in Houdini."),
+    ("I added a new asymmetrical vestibule", "on the porch stairs."),
+    ("It sits off-center", "as part of the porch entrance."),
+    ("I also started a Copernicus workflow", "for procedural materials like Substance Designer."),
+    ("Its advantage is staying", "inside the same software."),
+    ("I will see how far Copernicus can go", "compared with Substance Designer."),
+    ("Across my existing components,", "I identified the material tags."),
+    ("Those tags assign materials", "directly to the geometry."),
+    ("I chose four materials from", "my concept art and reference images."),
+    ("Next is the Karma XPU lookdev render.", "The complete graph is already set up."),
+]
+
+
+WEIGHT_NAMES = {400: b'Regular', 500: b'Medium', 600: b'SemiBold', 700: b'Bold',
+                800: b'ExtraBold', 900: b'Black'}
+
+
+def load_variable_font(path, size, weight):
+    # InterVariable carries TWO axes, optical size then weight: set_variation_by_axes([weight])
+    # silently sets the FIRST axis (optical size) instead, and the glyphs stay Regular.
+    # The named instance is unambiguous and matches exactly what "ExtraBold" means.
+    # FR : passer un seul poids regle le premier axe (optical size), pas le poids ; le nom evite l erreur.
+    font = ImageFont.truetype(path, size)
+    try:
+        font.set_variation_by_name(WEIGHT_NAMES.get(weight, b'Regular'))
+    except Exception:
+        pass
+    return font
+
+
+def fit_font(text, path, start_size, max_width, weight=None):
+    size = start_size
+    while size > 20:
+        font = (load_variable_font(path, size, weight) if weight else ImageFont.truetype(path, size))
+        box = font.getbbox(text)
+        if (box[2] - box[0]) <= max_width:
+            return font, box
+        size -= 2
+    font = (load_variable_font(path, size, weight) if weight else ImageFont.truetype(path, size))
+    return font, font.getbbox(text)
+
+
+def make_text_sprite(text, font, color, shadow_offset=(0, 0), shadow_blur=0, shadow_color=None):
+    """A tight RGBA sprite, so scaling it later scales the glyphs around their own center. The
+    shadow is baked into the same sprite (drawn first, blurred, then the crisp glyph on top), so
+    it rides along with the pop-in scale and opacity envelope for free."""
+    box = font.getbbox(text)
+    pad = 6 + shadow_blur + max(abs(shadow_offset[0]), abs(shadow_offset[1]))
+    width = box[2] - box[0] + pad * 2
+    height = box[3] - box[1] + pad * 2
+
+    sprite = Image.new('RGBA', (width, height), (0, 0, 0, 0))
+    origin = (pad - box[0], pad - box[1])
+
+    if shadow_color is not None and shadow_blur >= 0:
+        shadow_layer = Image.new('RGBA', (width, height), (0, 0, 0, 0))
+        shadow_draw = ImageDraw.Draw(shadow_layer)
+        shadow_draw.text((origin[0] + shadow_offset[0], origin[1] + shadow_offset[1]), text,
+                          font=font, fill=shadow_color)
+        if shadow_blur > 0:
+            shadow_layer = shadow_layer.filter(ImageFilter.GaussianBlur(shadow_blur))
+        sprite.alpha_composite(shadow_layer)
+
+    draw = ImageDraw.Draw(sprite)
+    draw.text(origin, text, font=font, fill=color)
+    return sprite
+
+
+def build_title_layer():
+    """Two runs, two fonts, one baseline. "Houdini" is upright and "Procedural Church" is italic: PIL has no
+    mixed-style text drawing, so the title is measured and placed as two separate runs that share
+    the SAME baseline, computed from each font's own ascent, not from the bounding box top."""
+    # Grow the title to the largest size whose PILL still fits inside the canvas with a margin:
+    # the size is not guessed, it is measured against the real pill width at each step.
+    # FR : la taille se mesure contre la vraie largeur de pastille, jamais devinee.
+    max_pill_width = int(P['width'] * P['title_max_pill_width_ratio'])
+    size = P['title_size_start']
+    while size > 24:
+        font_up = ImageFont.truetype(P['title_font'], size)
+        font_it = ImageFont.truetype(P['title_font_italic'], size)
+        w_up = font_up.getlength(P['title_text_upright'])
+        w_it = font_it.getlength(P['title_text_italic'])
+        ascent_up, descent_up = font_up.getmetrics()
+        ascent_it, descent_it = font_it.getmetrics()
+        cap_h = max(ascent_up, ascent_it)          # used only to size the padding, as before
+        pad_x = int(cap_h * P['title_pad_x_ratio'])
+        pill_w = w_up + w_it + pad_x * 2
+        if pill_w <= max_pill_width:
+            break
+        size -= 2
+
+    ascent = max(ascent_up, ascent_it)
+    descent = max(descent_up, descent_it)
+    text_h = ascent + descent
+    pad_x = int(cap_h * P['title_pad_x_ratio'])
+    pad_y = int(cap_h * P['title_pad_y_ratio'])
+    text_w = w_up + w_it
+    pill_w, pill_h = text_w + pad_x * 2, text_h + pad_y * 2
+    radius = int(pill_h * P['title_radius_ratio'])
+
+    layer = Image.new('RGBA', (P['width'], P['height']), (0, 0, 0, 0))
+    x0 = (P['width'] - pill_w) // 2
+    y0 = P['title_y_center'] - pill_h // 2
+
+    shadow_layer = Image.new('RGBA', (P['width'], P['height']), (0, 0, 0, 0))
+    sdx, sdy = P['title_shadow_offset']
+    ImageDraw.Draw(shadow_layer).rounded_rectangle(
+        [x0 + sdx, y0 + sdy, x0 + sdx + pill_w, y0 + sdy + pill_h],
+        radius=radius, fill=P['title_shadow_color'])
+    if P['title_shadow_blur'] > 0:
+        shadow_layer = shadow_layer.filter(ImageFilter.GaussianBlur(P['title_shadow_blur']))
+    layer.alpha_composite(shadow_layer)
+
+    draw = ImageDraw.Draw(layer)
+    draw.rounded_rectangle([x0, y0, x0 + pill_w, y0 + pill_h], radius=radius, fill=P['title_pill_bg'])
+
+    baseline_y = y0 + pad_y + ascent
+    draw.text((x0 + pad_x, baseline_y - ascent_up), P['title_text_upright'], font=font_up,
+              fill=P['title_text_color'])
+    draw.text((x0 + pad_x + w_up, baseline_y - ascent_it), P['title_text_italic'], font=font_it,
+              fill=P['title_text_color'])
+    return layer
+
+
+def envelope(local_t):
+    keys = P['pop_keys']
+    if local_t <= keys[0][0]:
+        return keys[0][1], keys[0][2]
+    if local_t >= keys[-1][0]:
+        return keys[-1][1], keys[-1][2]
+    for (t0, s0, o0), (t1, s1, o1) in zip(keys, keys[1:]):
+        if t0 <= local_t <= t1:
+            f = (local_t - t0) / (t1 - t0)
+            return s0 + (s1 - s0) * f, o0 + (o1 - o0) * f
+    return keys[-1][1], keys[-1][2]
+
+
+def paste_scaled(base, sprite, center_x, center_y, scale, opacity):
+    if opacity <= 0.0 or scale <= 0.0:
+        return
+    w, h = sprite.size
+    new_w, new_h = max(1, int(w * scale)), max(1, int(h * scale))
+    resized = sprite.resize((new_w, new_h), Image.LANCZOS)
+    if opacity < 1.0:
+        alpha = resized.getchannel('A').point(lambda a: int(a * opacity))
+        resized.putalpha(alpha)
+    base.alpha_composite(resized, (int(center_x - new_w / 2), int(center_y - new_h / 2)))
+
+
+def main():
+    max_width = int(P['width'] * P['subtitle_max_width_ratio'])
+    sprites = []
+    for line1, line2 in CUES:
+        font1, _ = fit_font(line1, P['subtitle_font'], P['subtitle_size_start'], max_width, P['subtitle_weight'])
+        font2, _ = fit_font(line2, P['subtitle_font'], P['subtitle_size_start'], max_width, P['subtitle_weight'])
+        sprites.append((
+            make_text_sprite(line1, font1, P['subtitle_color'], P['subtitle_shadow_offset'],
+                              P['subtitle_shadow_blur'], P['subtitle_shadow_color']),
+            make_text_sprite(line2, font2, P['subtitle_color'], P['subtitle_shadow_offset'],
+                              P['subtitle_shadow_blur'], P['subtitle_shadow_color']),
+        ))
+
+    title_layer = build_title_layer()
+
+    total_frames = int(round(P['duration'] * P['fps']))
+    out = sys.stdout.buffer
+    for frame_index in range(total_frames):
+        t = frame_index / P['fps']
+        cue_index = min(int(t // P['cue_seconds']), len(CUES) - 1)
+        local_t = t - cue_index * P['cue_seconds']
+        sprite1, sprite2 = sprites[cue_index]
+
+        frame = title_layer.copy()
+        scale1, opacity1 = envelope(max(0.0, local_t - P['pop_line1_offset']))
+        scale2, opacity2 = envelope(max(0.0, local_t - P['pop_line2_offset']))
+        if local_t < P['pop_line2_offset']:
+            opacity2 = 0.0
+        paste_scaled(frame, sprite1, P['width'] / 2, P['line1_y'], scale1, opacity1)
+        paste_scaled(frame, sprite2, P['width'] / 2, P['line2_y'], scale2, opacity2)
+
+        out.write(frame.tobytes())
+    out.flush()
+
+
+if __name__ == '__main__':
+    main()

@@ -1,0 +1,107 @@
+"""Render a soft, organic teal-to-blue background with a slow cloud flow.
+
+The V4 rework keeps the isotropic fBm field from V3. Brighter noise regions are mixed toward
+white, so they read as soft clouds rather than hard streaks. Frames are streamed as opaque RGBA
+pixels to ffmpeg's stdin.
+
+FR : le V4 reprend le bruit fBm isotrope du V3. Les zones de bruit plus claires sont melees au
+blanc pour former des nuages doux, sans revenir aux veines rigides de l ancien V4.
+"""
+import sys
+
+import numpy as np
+from PIL import Image, ImageFilter
+
+
+# Updated 2026-09-12: V4 keeps V3 cloud flow and adds a controlled white cloud lift.
+P = {
+    'width': 1080,
+    'height': 1920,
+    'fps': 30,
+    'duration': 30.0,
+    'color_top': (0x12, 0xE6, 0xA0),
+    'color_bottom': (0x0F, 0x7F, 0xE0),
+    'noise_octaves': 4,
+    'noise_low_res_divisor': 10,
+    'noise_blur_radius': 18,
+    'noise_amplitude': 0.26,
+    'scroll_speed_px_s': 30.0,
+    'cloud_floor': 0.30,
+    'cloud_ceiling': 0.86,
+    'cloud_strength': 0.28,
+    'cloud_softness': 0.90,
+    'base_brightness': 1.03,
+    'seed': 11,
+}
+
+
+def fbm_field(width, height, octaves, low_res_divisor, blur_radius, seed):
+    """Build a smooth multi-scale random field normalized to 0..1."""
+    rng = np.random.default_rng(seed)
+    acc = np.zeros((height, width), dtype=np.float32)
+    amplitude = 1.0
+    total = 0.0
+    divisor = low_res_divisor
+    for octave in range(octaves):
+        low_w = max(2, width // divisor)
+        low_h = max(2, height // divisor)
+        cell = rng.random((low_h, low_w), dtype=np.float32)
+        layer = Image.fromarray((cell * 255).astype(np.uint8), mode='L')
+        layer = layer.resize((width, height), Image.BICUBIC)
+        layer = layer.filter(ImageFilter.GaussianBlur(blur_radius / (octave + 1) ** 0.5))
+        acc += amplitude * (np.asarray(layer, dtype=np.float32) / 255.0)
+        total += amplitude
+        amplitude *= 0.55
+        divisor = max(2, divisor // 2)
+
+    acc /= total
+    acc -= acc.min()
+    acc /= max(1e-6, acc.max())
+    return acc
+
+
+def main():
+    width, height, fps, duration = P['width'], P['height'], P['fps'], P['duration']
+    scroll_range = int(P['scroll_speed_px_s'] * duration) + height
+    tall = fbm_field(
+        width,
+        scroll_range,
+        P['noise_octaves'],
+        P['noise_low_res_divisor'],
+        P['noise_blur_radius'],
+        P['seed'],
+    )
+
+    grad = np.linspace(0.0, 1.0, height, dtype=np.float32)[:, None]
+    grad = np.repeat(grad, width, axis=1)
+    top = np.array(P['color_top'], dtype=np.float32)
+    bottom = np.array(P['color_bottom'], dtype=np.float32)
+    total_frames = int(round(duration * fps))
+    out = sys.stdout.buffer
+
+    for frame_index in range(total_frames):
+        t = frame_index / fps
+        offset = int(t * P['scroll_speed_px_s']) % (scroll_range - height + 1)
+        noise_slice = tall[offset:offset + height, :]
+
+        value = grad + P['noise_amplitude'] * (noise_slice - 0.5)
+        value = np.clip(value, 0.0, 1.0)[:, :, None]
+        rgb = top[None, None, :] * (1.0 - value) + bottom[None, None, :] * value
+
+        cloud = (noise_slice - P['cloud_floor']) / max(
+            1e-6, P['cloud_ceiling'] - P['cloud_floor']
+        )
+        cloud = np.clip(cloud, 0.0, 1.0) ** P['cloud_softness']
+        rgb += (255.0 - rgb) * (P['cloud_strength'] * cloud[:, :, None])
+        rgb *= P['base_brightness']
+
+        rgba = np.empty((height, width, 4), dtype=np.uint8)
+        rgba[:, :, :3] = np.clip(rgb, 0, 255).astype(np.uint8)
+        rgba[:, :, 3] = 255
+        out.write(rgba.tobytes())
+
+    out.flush()
+
+
+if __name__ == '__main__':
+    main()
